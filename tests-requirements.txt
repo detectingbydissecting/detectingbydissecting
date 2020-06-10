@@ -1,0 +1,6 @@
+coverage
+pytest
+pytest-mock
+pytest-benchmark
+pylama
+tox
