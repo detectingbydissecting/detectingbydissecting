@@ -1,8 +1,8 @@
 import inspect
 import os
-import torch
 import pathlib
-import socket
+
+import torch
 
 from tda.rootpath import rootpath
 from tda.tda_logging import get_logger
@@ -10,15 +10,7 @@ from tda.tda_logging import get_logger
 logger = get_logger("Cache")
 
 
-if os.path.exists("/var/opt/data/user_data"):
-    # We are on gpu
-    cache_root = f"/var/opt/data/user_data/tda/"
-elif "mesos" in socket.gethostname():
-    # We are in mozart
-    cache_root = f"{os.environ['HOME']}/tda_cache/"
-else:
-    # Other cases (local)
-    cache_root = f"{rootpath}/cache/"
+cache_root = f"{rootpath}/cache/"
 
 logger.info(f"Cache root {cache_root}")
 
