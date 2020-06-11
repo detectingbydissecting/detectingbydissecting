@@ -26,7 +26,7 @@ base_configs = cartesian_product(
     }
 )
 
-binary = f"{rootpath}/tda/experiments/ocsvm_detector/our_binary.py"
+binary = f"{rootpath}/tda/experiments/ours/our_binary.py"
 
 all_experiments = list()
 
