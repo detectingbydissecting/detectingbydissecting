@@ -14,3 +14,5 @@ qgrid
 numba>=0.47.0
 cached-property>=1.5.1
 pandas
+fwg==0.2.11
+adversarial-robustness-toolbox
