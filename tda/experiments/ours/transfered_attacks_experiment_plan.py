@@ -1,18 +1,16 @@
+from copy import deepcopy
+
 from r3d3.experiment import R3D3ExperimentPlan, R3D3Experiment
 from r3d3.utils import cartesian_product
 
 from tda.embeddings import EmbeddingType, KernelType, ThresholdStrategy
 from tda.models.architectures import (
-    mnist_mlp,
     mnist_lenet,
     fashion_mnist_lenet,
-    fashion_mnist_mlp,
     svhn_lenet,
     cifar_lenet,
 )
 from tda.rootpath import rootpath, db_path
-from copy import deepcopy
-
 
 base_configs = cartesian_product(
     {
@@ -32,7 +30,14 @@ binary = f"{rootpath}/tda/experiments/ours/our_binary.py"
 
 all_experiments = list()
 
-for model, dataset, nb_epochs, best_threshold, threshold_strategy, sigmoidize_rawgraph in[
+for (
+    model,
+    dataset,
+    nb_epochs,
+    best_threshold,
+    threshold_strategy,
+    sigmoidize_rawgraph,
+) in [
     [
         mnist_lenet.name,
         "MNIST",
@@ -63,7 +68,7 @@ for model, dataset, nb_epochs, best_threshold, threshold_strategy, sigmoidize_ra
         300,
         "0:0_2:0_4:0_5:0.1_6:0.3",
         ThresholdStrategy.UnderoptimizedMagnitudeIncrease,
-        True
+        True,
     ],
 ]:
     for config in base_configs:
@@ -79,7 +84,7 @@ for model, dataset, nb_epochs, best_threshold, threshold_strategy, sigmoidize_ra
             config["sigmoidize"] = True
         elif config["embedding_type"] == EmbeddingType.RawGraph:
             config["kernel_type"] = KernelType.RBF
- 
+
         all_experiments.append(R3D3Experiment(binary=binary, config=config))
 
 experiment_plan = R3D3ExperimentPlan(

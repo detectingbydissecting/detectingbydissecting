@@ -1,15 +1,15 @@
+from copy import deepcopy
+
 from r3d3.experiment import R3D3ExperimentPlan, R3D3Experiment
 from r3d3.utils import cartesian_product
+
 from tda.models.architectures import (
-    mnist_mlp,
     mnist_lenet,
     fashion_mnist_lenet,
-    fashion_mnist_mlp,
     svhn_lenet,
     cifar_lenet,
 )
 from tda.rootpath import rootpath, db_path
-from copy import deepcopy
 
 base_configs = cartesian_product(
     {
@@ -28,9 +28,7 @@ binary = f"{rootpath}/tda/experiments/mahalanobis/mahalanobis_binary.py"
 all_experiments = list()
 
 for model, dataset, nb_epochs in [
-    [mnist_mlp.name, "MNIST", 50],
     [mnist_lenet.name, "MNIST", 50],
-    [fashion_mnist_mlp.name, "FashionMNIST", 50],
     [fashion_mnist_lenet.name, "FashionMNIST", 100],
     [svhn_lenet.name, "SVHN", 300],
     [cifar_lenet.name, "CIFAR10", 300],
