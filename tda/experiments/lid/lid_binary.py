@@ -4,7 +4,6 @@
 import argparse
 import io
 import os
-import re
 import time
 import traceback
 from typing import NamedTuple, Optional, Set, List
@@ -234,7 +233,7 @@ def get_feature_datasets(
         logger.info(f"Generating datasets on the trensferred architecture")
         trsf_archi = archi
         trsf_archi.epochs += 1
-        train_clean_, test_clean_, train_adv_, test_adv_ = get_protocolar_datasets(
+        get_protocolar_datasets(
             noise=config.noise,
             dataset=dataset,
             succ_adv=config.successful_adv > 0,
@@ -291,7 +290,7 @@ def get_feature_datasets(
 
 
 def run_experiment(config: Config):
-    logger.info(f"Starting experiment {config.experiment_id}_{config.run_id}")
+    logger.info(f"Starting experiment...")
 
     dataset = Dataset(name=config.dataset)
 
@@ -343,7 +342,7 @@ def run_experiment(config: Config):
 
     metrics = {"name": "LID", "time": time.time() - start_time, **evaluation_results}
 
-    logger.info(f"Done with experiment {config.experiment_id}_{config.run_id} !")
+    logger.info(f"Done with experiment !")
     logger.info(metrics)
 
     return metrics
