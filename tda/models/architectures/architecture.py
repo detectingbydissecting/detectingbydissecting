@@ -5,13 +5,15 @@ from typing import List, Callable, Tuple, Dict
 import torch
 import torch.nn as nn
 from art.classifiers import PyTorchClassifier
+import foolbox as fb
+from cached_property import cached_property
 
 from tda.devices import device
 from tda.models.layers import (
     Layer,
     SoftMaxLayer,
 )
-from tda.rootpath import rootpath
+from tda.rootpath import model_dir
 from tda.tda_logging import get_logger
 
 torch.set_default_tensor_type(torch.DoubleTensor)
@@ -55,18 +57,43 @@ class Architecture(nn.Module):
 
         self.is_trained = False
 
-        self.art_classifier = None
-
         self.epochs = 0
         self.train_noise = 0.0
         self.tot_prune_percentile = 0.0
+        self.default_forward_mode = None
 
+        self.to_device(device)
+
+    def to_device(self, device):
+        for layer in self.layers:
+            layer.to(device)
         self.to(device)
+
+    def set_default_forward_mode(self, mode):
+        self.default_forward_mode = mode
 
     def build_matrices(self):
         for layer in self.layers:
             if layer.graph_layer:
+                logger.info(f"Building matrix for layer {layer}")
                 layer.build_matrix()
+
+    def threshold_layers(self, edges_to_keep):
+        for layeridx, layer in enumerate(self.layers):
+            if (layer.graph_layer) and (layeridx in edges_to_keep.keys()):
+                #logger.info(f"Thresholding layer {layeridx} !!")
+                edges_to_keep_layer = edges_to_keep[layeridx]
+                layer.get_matrix_thresholded(edges_to_keep_layer)
+        logger.info(f"Done thresholding")
+
+    @cached_property
+    def matrices_are_built(self):
+        try:
+            self.build_matrices()
+            done = True
+        except Exception:
+            done = False
+        return done
 
     def get_layer_matrices(self):
         return {
@@ -74,7 +101,7 @@ class Architecture(nn.Module):
         }
 
     def get_model_savepath(self, initial: bool = False):
-        return f"{rootpath}/trained_models/{self.get_full_name(initial=initial)}.model"
+        return f"{model_dir}/{self.get_full_name(initial=initial)}.model"
 
     def get_initial_model(self) -> "Architecture":
         """
@@ -119,24 +146,29 @@ class Architecture(nn.Module):
 
         return [link for link in self.layer_links if link[1] == softmax_layer_idx][0][0]
 
-    def get_art_classifier(self):
-        if not hasattr(self, "art_classifier") or self.art_classifier is None:
-            if "bandw" in self.name:
-                input_shape = (1, 32, 32)
-            elif "svhn" in self.name or "cifar" in self.name:
-                input_shape = (3, 32, 32)
-            elif "mnist" in self.name:
-                input_shape = (1, 28, 28)
+    @cached_property
+    def art_classifier(self):
+        if "bandw" in self.name:
+            input_shape = (1, 32, 32)
+        elif "svhn" in self.name or "cifar" in self.name:
+            input_shape = (3, 32, 32)
+        elif "mnist" in self.name:
+            input_shape = (1, 28, 28)
 
-            self.art_classifier = PyTorchClassifier(
-                model=self,
-                clip_values=(0, 1),
-                loss=torch.nn.CrossEntropyLoss(),
-                optimizer=None,
-                input_shape=input_shape,
-                nb_classes=10,
-            )
-        return self.art_classifier
+        logger.info(f"Input shape is {input_shape}")
+
+        return PyTorchClassifier(
+            model=self,
+            clip_values=(0, 1),
+            loss=torch.nn.CrossEntropyLoss(),
+            optimizer=None,
+            input_shape=input_shape,
+            nb_classes=10,
+        )
+
+    @cached_property
+    def foolbox_classifier(self):
+        return fb.PyTorchModel(self, bounds=(0, 1), device=device)
 
     @staticmethod
     def walk_through_dag(edges: List[Tuple[int, int]]) -> List[int]:
@@ -177,6 +209,14 @@ class Architecture(nn.Module):
         return ret
 
     def forward(self, x, store_for_graph=False, output="final"):
+
+        # Override output mode if needed
+        if (
+            hasattr(self, "default_forward_mode")
+            and self.default_forward_mode is not None
+        ):
+            output = self.default_forward_mode
+
         # List to store intermediate results if needed
 
         if not torch.is_tensor(x):

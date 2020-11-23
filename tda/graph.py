@@ -15,6 +15,7 @@ class Graph(object):
     @classmethod
     def from_architecture_and_data_point(cls, architecture: Architecture, x: Tensor):
         raw_edge_dict = architecture.get_graph_values(x)
+        #logger.info(f"raw_edge_dict = {raw_edge_dict}")
         edge_dict = dict()
         for layer_link in raw_edge_dict:
             v = raw_edge_dict[layer_link]
@@ -52,6 +53,10 @@ class Graph(object):
                 )
             else:
                 self._edge_dict[layer_link] = coo_matrix(np.zeros(np.shape(v)))
+        a = {key : 
+        {(r, c): d for r,c,d in zip(self._edge_dict[key].row,self._edge_dict[key].col,self._edge_dict[key].data)}
+        for key in self._edge_dict.keys()}
+        #logger.info(f"self edge dict =  {a}")
 
     def thresholdize_per_graph(self, thresholds: typing.Dict, low_pass: bool):
         for layer_link in self._edge_dict:
@@ -83,20 +88,18 @@ class Graph(object):
     #            v = coo_matrix(np.zeros(np.shape(v)))
     #        self._edge_dict[layer_link] = v
 
-    def sigmoidize(self, all_weights, quant=0.999):
+    def sigmoidize(self, quantiles_helpers, quant=0.999):
         for layer_link in self._edge_dict:
             v = self._edge_dict[layer_link]
             # Take median and "good" quantile to scale sigmoid
-            if isinstance(all_weights[layer_link], dict):
-                med, qu = all_weights[layer_link][0.5], all_weights[layer_link][quant]
-            else:
-                med, qu = (
-                    np.quantile(all_weights[layer_link], 0.5),
-                    np.quantile(all_weights[layer_link], quant),
-                )
+            qs = quantiles_helpers[layer_link].get_quantiles([0.5, quant])
+            med = qs[0]
+            qu = qs[1]
+
             k = -1 / (qu - med) * np.log(0.001 / 0.999)
             # Apply sigmoid
             val = 1 / (1 + np.exp(-k * (v.data - med)))
+            logger.info(f"For layer link = {layer_link} med = {med} and qu = {qu} and k = {k} and val = {val[:5]}")
             v = coo_matrix((val, (v.row, v.col)), np.shape(v))
             self._edge_dict[layer_link] = v
 
@@ -132,10 +135,14 @@ class Graph(object):
             np.cumsum([shapes[idx] for idx in all_layer_indices])
         )
         vertex_offset = vertex_offset[:-1]
+        a = {key : 
+        {(r, c): d for r,c,d in zip(self._edge_dict[key].row,self._edge_dict[key].col,self._edge_dict[key].data)}
+        for key in self._edge_dict.keys()}
+        #logger.info(f"self edge dict =  {a}")
 
         for source_layer, target_layer in self._edge_dict:
-            offset_source = vertex_offset[source_layer + 1]
-            offset_target = vertex_offset[target_layer + 1]
+            offset_source = vertex_offset[all_layer_indices.index(source_layer)]
+            offset_target = vertex_offset[all_layer_indices.index(target_layer)]
             mat = self._edge_dict[(source_layer, target_layer)]
 
             for i in range(len(mat.data)):
@@ -143,6 +150,7 @@ class Graph(object):
                 target_vertex = mat.row[i] + offset_target
                 weight = mat.data[i]
                 ret.append(([source_vertex, target_vertex], weight))
+        #logger.info(f"ret = {ret}")
         return ret
 
     def get_adjacency_matrix(self) -> coo_matrix:

@@ -5,21 +5,20 @@ import argparse
 import time
 import typing
 import pathlib
+import pickle
 
 import matplotlib.pyplot as plt
 import numpy as np
-from r3d3 import ExperimentDB
 
-from tda.graph_dataset import process_sample, get_sample_dataset
+from tda.dataset.graph_dataset import get_sample_dataset, AttackBackend
 from tda.models import Dataset, get_deep_model
 from tda.models.architectures import Architecture
 from tda.models.architectures import get_architecture, svhn_lenet
 from tda.tda_logging import get_logger
-from tda.rootpath import db_path, rootpath
+from tda.rootpath import rootpath
 
 start_time = time.time()
 
-my_db = ExperimentDB(db_path=db_path)
 
 logger = get_logger("GraphStats")
 
@@ -37,14 +36,16 @@ class Config(typing.NamedTuple):
     train_noise: float
     # Size of the dataset used for the experiment
     dataset_size: int
-    # Type of attack (FGSM, BIM, CW)
+    # Type of attack (FGSM, PGD, CW)
     attack_type: str
+    # Backend for the attack
+    attack_backend: str
     # Parameter used by DeepFool and CW
     num_iter: int
     # Pruning
-    first_pruned_iter : int = 10
-    prune_percentile : float = 0.0
-    tot_prune_percentile : float = 0.0
+    first_pruned_iter: int = 10
+    prune_percentile: float = 0.0
+    tot_prune_percentile: float = 0.0
     # Default parameters when running interactively for instance
     # Used to store the results in the DB
     experiment_id: int = int(time.time())
@@ -72,7 +73,7 @@ def get_config() -> Config:
     parser.add_argument("--first_pruned_iter", type=int, default=10)
     parser.add_argument("--prune_percentile", type=float, default=0.0)
     parser.add_argument("--tot_prune_percentile", type=float, default=0.0)
-
+    parser.add_argument("--attack_backend", type=str, default=AttackBackend.ART)
 
     args, _ = parser.parse_known_args()
 
@@ -87,7 +88,7 @@ def compute_adv_accuracy(
     dataset_size: int = 100,
     attack_type: str = "FGSM",
     num_iter: int = 50,
-) -> float:
+) -> (float, typing.List):
     # Else we have to compute the dataset first
 
     dataset = get_sample_dataset(
@@ -102,6 +103,7 @@ def compute_adv_accuracy(
         attack_type=attack_type,
         num_iter=num_iter,
         compute_graph=False,
+        attack_backend=config.attack_backend,
     )
 
     # Since we set succ_adv to False, we should have
@@ -109,20 +111,17 @@ def compute_adv_accuracy(
     assert len(dataset) == dataset_size
 
     corr = sum([1 for line in dataset if line.y == line.y_pred])
-    return corr / dataset_size
+
+    some_images = [line.x for line in dataset if line.y != line.y_pred][:8]
+
+    return corr / dataset_size, some_images
 
 
 def get_all_accuracies(config: Config):
 
-    if __name__ != "__main__":
-        my_db.add_experiment(
-            experiment_id=config.experiment_id,
-            run_id=config.run_id,
-            config=config._asdict(),
-        )
-
-    if config.attack_type in ["FGSM", "BIM"]:
-        all_epsilons = list(sorted(np.linspace(0.0, 0.4, num=11)))
+    if config.attack_type in ["FGSM", "PGD"]:
+        all_epsilons = list(sorted(np.linspace(0.0, 0.5, num=21)))
+        # all_epsilons = [0, 0.001, 0.0025, 0.005, 0.0075, 0.01, 0.02, 0.03, 0.04, 0.05, 0.1]
     else:
         all_epsilons = [0.0, 1]
 
@@ -137,12 +136,18 @@ def get_all_accuracies(config: Config):
         tot_prune_percentile=config.tot_prune_percentile,
         first_pruned_iter=config.first_pruned_iter,
     )
+    # architecture = torch.load(
+    #        f"{rootpath}/trained_models/cifar_resnet_1_e_99.model.model", map_location=device
+    #    )
+    # architecture.set_eval_mode()
+    # architecture.is_trained = True
+    # assert architecture.matrices_are_built is True
 
     accuracies = dict()
 
     for epsilon in all_epsilons:
 
-        adversarial_acc = compute_adv_accuracy(
+        adversarial_acc, some_images = compute_adv_accuracy(
             epsilon=epsilon,
             noise=config.noise,
             dataset=dataset,
@@ -154,6 +159,9 @@ def get_all_accuracies(config: Config):
 
         logger.info(f"Epsilon={epsilon}: acc={adversarial_acc}")
         accuracies[epsilon] = adversarial_acc
+
+        with open(config.result_path + f"/images_eps_{epsilon}.pickle", "wb") as fw:
+            pickle.dump(some_images, fw)
 
     return accuracies
 
@@ -177,18 +185,18 @@ def plot_and_save(config, accuracies):
     plt.xlabel("Perturbation value")
     plt.ylabel("Accuracy")
     plt.ylim(0, 1)
-    plt.savefig(file_name, dpi=800)
+    plt.savefig(file_name, dpi=150)
     plt.close()
 
-    my_db.update_experiment(
-        experiment_id=config.experiment_id,
-        run_id=config.run_id,
-        metrics={"accuracies": accuracies},
-    )
-
     end_time = time.time()
+    total_time = end_time - start_time
 
-    logger.info(f"Success in {end_time - start_time} seconds")
+    metrics = {"accuracies": accuracies, "total_time": total_time}
+
+    logger.info(f"Success in {total_time} seconds")
+    logger.info(metrics)
+
+    return metrics
 
 
 if __name__ == "__main__":
