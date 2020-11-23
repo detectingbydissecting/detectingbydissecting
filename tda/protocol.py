@@ -8,8 +8,9 @@ from sklearn.model_selection import train_test_split
 from sklearn.svm import OneClassSVM, SVC
 from sklearn.utils import check_random_state
 
+from tda.dataset.adversarial_generation import AttackBackend
 from tda.embeddings import get_gram_matrix
-from tda.graph_dataset import get_sample_dataset
+from tda.dataset.graph_dataset import get_sample_dataset
 from tda.models import Architecture, Dataset
 from tda.tda_logging import get_logger
 
@@ -24,6 +25,7 @@ def get_protocolar_datasets(
     dataset_size: int,
     attack_type: str,
     all_epsilons: typing.List,
+    attack_backend: str = AttackBackend.FOOLBOX,
     compute_graph: bool = False,
     transfered_attacks: bool = False,
 ):
@@ -38,6 +40,7 @@ def get_protocolar_datasets(
         succ_adv=succ_adv,
         archi=archi,
         attack_type=attack_type,
+        attack_backend=attack_backend,
         dataset_size=dataset_size // 2,  # 8,
         offset=0,
         compute_graph=compute_graph,
@@ -54,6 +57,7 @@ def get_protocolar_datasets(
             succ_adv=succ_adv,
             archi=archi,
             attack_type=attack_type,
+            attack_backend=attack_backend,
             dataset_size=dataset_size // 2,  # 8,
             offset=0,
             compute_graph=compute_graph,
@@ -69,6 +73,7 @@ def get_protocolar_datasets(
         succ_adv=succ_adv,
         archi=archi,
         attack_type=attack_type,
+        attack_backend=attack_backend,
         dataset_size=dataset_size // 2,  # 8,
         offset=dataset_size // 2,  # 8,
         compute_graph=compute_graph,
@@ -85,6 +90,7 @@ def get_protocolar_datasets(
             succ_adv=succ_adv,
             archi=archi,
             attack_type=attack_type,
+            attack_backend=attack_backend,
             dataset_size=dataset_size // 2,  # 8,
             offset=dataset_size // 2,  # 8,
             compute_graph=compute_graph,
@@ -103,6 +109,7 @@ def get_protocolar_datasets(
             succ_adv=succ_adv,
             archi=archi,
             attack_type=attack_type,
+            attack_backend=attack_backend,
             epsilon=epsilon,
             num_iter=100,
             dataset_size=dataset_size,
@@ -214,6 +221,9 @@ def evaluate_embeddings(
     all_predictions_supervised = dict()
     aucs_l2_norm = dict()
 
+    param_curve = dict()
+    param_curve_supervised = dict()
+
     for key in all_adv_embeddings_train:
 
         best_metrics = dict()
@@ -296,6 +306,7 @@ def evaluate_embeddings(
                 logger.info(
                     f"[nu={nu}] AUC score for param = {param} : {metrics['auc'].value}"
                 )
+                param_curve["_".join([str(key), str(nu), str(param.get("gamma", 0))])] = metrics['auc'].value
 
                 if metrics["auc"].is_better_than(best_metrics.get("auc", worst_metric)):
                     best_metrics = metrics
@@ -347,6 +358,7 @@ def evaluate_embeddings(
             logger.info(
                 f"Supervised AUC score for param = {param} : {metrics['auc'].value}"
             )
+            param_curve_supervised["_".join([str(key), str(param.get("gamma", 0))])] = metrics['auc'].value
 
             if metrics["auc"].is_better_than(
                 best_metrics_supervised.get("auc", worst_metric)
@@ -378,6 +390,7 @@ def evaluate_embeddings(
         "supervised_metrics": all_metrics_supervised,
         "unsupervised_predictions": all_predictions,
         "supervised_predictions": all_predictions_supervised,
+        "param_curve": param_curve,
         "aucs_l2_norm": aucs_l2_norm if len(aucs_l2_norm) > 0 else "None",
     }
 

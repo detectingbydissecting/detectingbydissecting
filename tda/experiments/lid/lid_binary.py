@@ -4,24 +4,23 @@
 import argparse
 import io
 import os
+import re
 import time
 import traceback
-import typing
-import re
+from typing import NamedTuple, Optional, Set, List
 
 import numpy as np
 import torch
-from r3d3.experiment_db import ExperimentDB
 from sklearn.metrics.pairwise import euclidean_distances
 
+from tda.dataset.adversarial_generation import AttackType
+from tda.dataset.graph_dataset import DatasetLine
 from tda.embeddings import KernelType
-from tda.graph_dataset import DatasetLine
-from tda.tda_logging import get_logger
 from tda.models import Dataset, get_deep_model, mnist_lenet
 from tda.models.architectures import SoftMaxLayer
 from tda.models.architectures import get_architecture, Architecture
 from tda.protocol import get_protocolar_datasets, evaluate_embeddings
-from tda.rootpath import db_path
+from tda.tda_logging import get_logger
 
 logger = get_logger("LID")
 
@@ -31,10 +30,8 @@ plot_path = f"{os.path.dirname(os.path.realpath(__file__))}/plots"
 if not os.path.exists(plot_path):
     os.mkdir(plot_path)
 
-my_db = ExperimentDB(db_path=db_path)
 
-
-class Config(typing.NamedTuple):
+class Config(NamedTuple):
     # Noise to consider for the noisy samples
     noise: float
     # Number of epochs for the model
@@ -51,33 +48,31 @@ class Config(typing.NamedTuple):
     perc_of_nn: int
     # Batch size for the estimation of the LID
     batch_size: int
-    # Type of attack (FGSM, BIM, CW)
+    # Selected layers
+    selected_layers: Optional[Set[int]]
+    # Type of attack (FGSM, PGD, CW)
     attack_type: str
     # Should we filter out non successful_adversaries
     successful_adv: int
     # Transfered attacks
     transfered_attacks: bool = False
     # Pruning
-    first_pruned_iter : int = 10
-    prune_percentile : float = 0.0
-    tot_prune_percentile : float = 0.0
-    # Default parameters when running interactively for instance
-    # Used to store the results in the DB
-    experiment_id: int = int(time.time())
-    run_id: int = 0
+    first_pruned_iter: int = 10
+    prune_percentile: float = 0.0
+    tot_prune_percentile: float = 0.0
 
-    all_epsilons: typing.List[float] = None
+    all_epsilons: List[float] = None
+
 
 def str2bool(value):
-    if value in [True, "True", 'true']:
+    if value in [True, "True", "true"]:
         return True
     else:
         return False
 
+
 def get_config() -> Config:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--experiment_id", type=int, default=-1)
-    parser.add_argument("--run_id", type=int, default=-1)
 
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--dataset", type=str, default="MNIST")
@@ -85,7 +80,7 @@ def get_config() -> Config:
     parser.add_argument("--attack_type", type=str, default="FGSM")
     parser.add_argument("--noise", type=float, default=0.0)
     parser.add_argument("--train_noise", type=float, default=0.0)
-    parser.add_argument("--dataset_size", type=int, default=100)
+    parser.add_argument("--dataset_size", type=int, default=500)
     parser.add_argument("--batch_size", type=int, default=100)
     parser.add_argument("--perc_of_nn", type=float, default=0.2)
     parser.add_argument("--successful_adv", type=int, default=1)
@@ -94,11 +89,17 @@ def get_config() -> Config:
     parser.add_argument("--first_pruned_iter", type=int, default=10)
     parser.add_argument("--prune_percentile", type=float, default=0.0)
     parser.add_argument("--tot_prune_percentile", type=float, default=0.0)
+    parser.add_argument("--selected_layers", type=str, default="all")
 
     args, _ = parser.parse_known_args()
 
     if args.all_epsilons is not None:
         args.all_epsilons = list(map(float, str(args.all_epsilons).split(";")))
+
+    if args.selected_layers != "all":
+        args.selected_layers = set([int(s) for s in args.selected_layers.split(";")])
+    else:
+        args.selected_layers = None
 
     return Config(**args.__dict__)
 
@@ -106,9 +107,9 @@ def get_config() -> Config:
 def create_lid_dataset(
     config: Config,
     archi: Architecture,
-    input_dataset: typing.List[DatasetLine],
-    clean_dataset: typing.List[DatasetLine],
-) -> (typing.List, typing.List, typing.List):
+    input_dataset: List[DatasetLine],
+    clean_dataset: List[DatasetLine],
+) -> (List, List, List):
     logger.debug(f"Dataset size is {len(input_dataset)}")
 
     nb_batches = int(np.ceil(len(input_dataset) / config.batch_size))
@@ -148,15 +149,25 @@ def create_lid_dataset(
             output="all_inner",
         )
 
-        lids = np.zeros((actual_batch_size, len(archi.layers) - 1))
+        lids = np.zeros((actual_batch_size, len(archi.layers)))
+        valid_lid_columns = list()
 
         for layer_idx in archi.layer_visit_order:
+            if (
+                config.selected_layers is not None
+                and layer_idx not in config.selected_layers
+            ):
+                # Skipping layer since not in selected_layers
+                continue
             if layer_idx == -1:
                 # Skipping input
                 continue
             if isinstance(archi.layers[layer_idx], SoftMaxLayer):
                 # Skipping softmax
                 continue
+
+            valid_lid_columns.append(layer_idx)
+
             activations_layer = (
                 activations[layer_idx]
                 .reshape(actual_batch_size, -1)
@@ -205,6 +216,7 @@ def create_lid_dataset(
 
                 lids[sample_idx, layer_idx] = lid
 
+        lids = lids[:, valid_lid_columns]
         all_lids.append(lids)
         l2_norms += [line.l2_norm for line in raw_batch]
         linf_norms += [line.linf_norm for line in raw_batch]
@@ -215,10 +227,28 @@ def create_lid_dataset(
 
 
 def get_feature_datasets(
-    config: Config, epsilons: typing.List[float], dataset: Dataset, archi: Architecture
+    config: Config, epsilons: List[float], dataset: Dataset, archi: Architecture
 ):
     logger.info(f"Evaluating epsilon={epsilons}")
-
+    if config.transfered_attacks:
+        logger.info(f"Generating datasets on the trensferred architecture")
+        trsf_archi = archi
+        trsf_archi.epochs += 1
+        train_clean_, test_clean_, train_adv_, test_adv_ = get_protocolar_datasets(
+            noise=config.noise,
+            dataset=dataset,
+            succ_adv=config.successful_adv > 0,
+            archi=trsf_archi,
+            dataset_size=config.dataset_size,
+            attack_type=config.attack_type,
+            # attack_backend=config.attack_backend,
+            all_epsilons=epsilons,
+            transfered_attacks=config.transfered_attacks,
+        )
+        archi.epochs = archi.epochs - 1
+        logger.info(
+            f"After generating transferred attacks, archi epochs = {archi.epochs}"
+        )
     train_clean, test_clean, train_adv, test_adv = get_protocolar_datasets(
         noise=config.noise,
         dataset=dataset,
@@ -226,6 +256,7 @@ def get_feature_datasets(
         archi=archi,
         dataset_size=config.dataset_size,  # 2 * config.batch_size * config.nb_batches,  # Train + Test
         attack_type=config.attack_type,
+        # attack_backend=config.attack_backend,
         all_epsilons=epsilons,
         transfered_attacks=config.transfered_attacks,
     )
@@ -262,13 +293,6 @@ def get_feature_datasets(
 def run_experiment(config: Config):
     logger.info(f"Starting experiment {config.experiment_id}_{config.run_id}")
 
-    if __name__ != "__main__":
-        my_db.add_experiment(
-            experiment_id=config.experiment_id,
-            run_id=config.run_id,
-            config=config._asdict(),
-        )
-
     dataset = Dataset(name=config.dataset)
 
     logger.info(f"Getting deep model...")
@@ -282,7 +306,7 @@ def run_experiment(config: Config):
         first_pruned_iter=config.first_pruned_iter,
     )
 
-    if config.attack_type not in ["FGSM", "BIM", "FGSM_art", "BIM_art"]:
+    if config.attack_type not in ["FGSM", "PGD"]:
         all_epsilons = [1.0]
     elif config.all_epsilons is None:
         all_epsilons = [0.01, 0.05, 0.1, 0.4, 1.0]
@@ -300,7 +324,7 @@ def run_experiment(config: Config):
         config=config, epsilons=all_epsilons, dataset=dataset, archi=archi
     )
 
-    if config.attack_type in ["DeepFool", "CW"]:
+    if config.attack_type in ["DeepFool", "CW", AttackType.BOUNDARY]:
         stats_for_l2_norm_buckets = stats
     else:
         stats_for_l2_norm_buckets = dict()
@@ -317,15 +341,12 @@ def run_experiment(config: Config):
 
     logger.info(evaluation_results)
 
-    my_db.update_experiment(
-        experiment_id=config.experiment_id,
-        run_id=config.run_id,
-        metrics={"name": "LID", "time": time.time() - start_time, **evaluation_results},
-    )
+    metrics = {"name": "LID", "time": time.time() - start_time, **evaluation_results}
 
     logger.info(f"Done with experiment {config.experiment_id}_{config.run_id} !")
+    logger.info(metrics)
 
-    return evaluation_results
+    return metrics
 
 
 if __name__ == "__main__":
@@ -337,9 +358,3 @@ if __name__ == "__main__":
         traceback.print_exc(file=my_trace)
 
         logger.error(my_trace.getvalue())
-
-        my_db.update_experiment(
-            experiment_id=my_config.experiment_id,
-            run_id=my_config.run_id,
-            metrics={"ERROR": re.escape(my_trace.getvalue())},
-        )

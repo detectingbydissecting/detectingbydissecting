@@ -4,33 +4,34 @@
 import argparse
 import io
 import time
-import re
 import traceback
-import typing
+from typing import NamedTuple, List
 
 import numpy as np
 from joblib import delayed, Parallel
-from r3d3.experiment_db import ExperimentDB
 from sklearn.decomposition import PCA
 
-from tda.embeddings import get_embedding, EmbeddingType, KernelType, ThresholdStrategy
+from tda.dataset.adversarial_generation import AttackType, AttackBackend
+from tda.embeddings import (
+    get_embedding,
+    EmbeddingType,
+    KernelType,
+    ThresholdStrategy,
+    Embedding,
+)
 from tda.embeddings.raw_graph import identify_active_indices, featurize_vectors
+from tda.graph_stats import get_quantiles_helpers
 from tda.models import get_deep_model, Dataset
 from tda.models.architectures import mnist_mlp, get_architecture
 from tda.protocol import get_protocolar_datasets, evaluate_embeddings
-from tda.rootpath import db_path
 from tda.tda_logging import get_logger
 from tda.threshold_underoptimized_edges import process_thresholds_underopt
-from tda.thresholds import process_thresholds
-from tda.graph_stats import get_stats
 
 logger = get_logger("Detector")
 start_time = time.time()
 
-my_db = ExperimentDB(db_path=db_path)
 
-
-class Config(typing.NamedTuple):
+class Config(NamedTuple):
     # Type of embedding to use
     embedding_type: str
     # Type of kernel to use on the embeddings
@@ -39,8 +40,6 @@ class Config(typing.NamedTuple):
     thresholds: str
     # Which thresholding strategy should we use
     threshold_strategy: str
-    # Are the threshold low pass or not
-    thresholds_are_low_pass: bool
     # Noise to consider for the noisy samples
     noise: float
     # Number of epochs for the model
@@ -55,8 +54,10 @@ class Config(typing.NamedTuple):
     dataset_size: int
     # Should we ignore unsuccessful attacks or not
     successful_adv: int
-    # Type of attack (FGSM, BIM, CW)
+    # Type of attack (FGSM, PGD, CW)
     attack_type: str
+    # Type of attack (CUSTOM, ART, FOOLBOX)
+    attack_backend: str
     # Parameter used by DeepFool and CW
     num_iter: int
     # PCA Parameter for RawGraph (-1 = No PCA)
@@ -76,7 +77,7 @@ class Config(typing.NamedTuple):
     # Number of processes to spawn
     n_jobs: int = 1
 
-    all_epsilons: typing.List[float] = None
+    all_epsilons: List[float] = None
 
 
 def str2bool(value):
@@ -95,27 +96,27 @@ def get_config() -> Config:
     parser.add_argument(
         "--embedding_type", type=str, default=EmbeddingType.PersistentDiagram
     )
-    parser.add_argument("--kernel_type", type=str, default=KernelType.SlicedWasserstein)
     parser.add_argument("--thresholds", type=str, default="0")
     parser.add_argument(
-        "--threshold_strategy", type=str, default=ThresholdStrategy.ActivationValue
+        "--threshold_strategy",
+        type=str,
+        default=ThresholdStrategy.UnderoptimizedMagnitudeIncrease,
     )
     parser.add_argument("--noise", type=float, default=0.0)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--dataset", type=str, default="MNIST")
     parser.add_argument("--architecture", type=str, default=mnist_mlp.name)
     parser.add_argument("--train_noise", type=float, default=0.0)
-    parser.add_argument("--dataset_size", type=int, default=100)
+    parser.add_argument("--dataset_size", type=int, default=500)
     parser.add_argument("--successful_adv", type=int, default=1)
     parser.add_argument("--raw_graph_pca", type=int, default=-1)
-    parser.add_argument("--attack_type", type=str, default="FGSM")
+    parser.add_argument("--attack_type", type=str, default=AttackType.FGSM)
+    parser.add_argument("--attack_backend", type=str, default=AttackBackend.FOOLBOX)
     parser.add_argument("--transfered_attacks", type=str2bool, default=False)
     parser.add_argument("--num_iter", type=int, default=10)
     parser.add_argument("--n_jobs", type=int, default=1)
     parser.add_argument("--all_epsilons", type=str, default=None)
     parser.add_argument("--l2_norm_quantile", type=bool, default=True)
-    parser.add_argument("--sigmoidize", type=str2bool, default=False)
-    parser.add_argument("--thresholds_are_low_pass", type=str2bool, default=True)
     parser.add_argument("--first_pruned_iter", type=int, default=10)
     parser.add_argument("--prune_percentile", type=float, default=0.0)
     parser.add_argument("--tot_prune_percentile", type=float, default=0.0)
@@ -124,10 +125,22 @@ def get_config() -> Config:
 
     if args.all_epsilons is not None:
         args.all_epsilons = list(map(float, str(args.all_epsilons).split(";")))
+
+    if args.embedding_type == EmbeddingType.PersistentDiagram:
+        args.kernel_type = KernelType.SlicedWasserstein
+        args.sigmoidize = False
+    elif args.embedding_type == EmbeddingType.RawGraph:
+        args.kernel_type = KernelType.RBF
+        args.sigmoidize = True
+
+    logger.info(args.__dict__)
+
     return Config(**args.__dict__)
 
 
 def get_all_embeddings(config: Config):
+    detailed_times = dict()
+
     architecture = get_architecture(config.architecture)
     dataset = Dataset.get_or_create(name=config.dataset)
 
@@ -142,43 +155,30 @@ def get_all_embeddings(config: Config):
     )
     if config.sigmoidize:
         logger.info(f"Using inter-class regularization (sigmoid)")
-        all_weights = get_stats(
+        start_time = time.time()
+        quantiles_helpers = get_quantiles_helpers(
             dataset=dataset, architecture=architecture, dataset_size=100
         )
+        detailed_times["stats"] = time.time() - start_time
+
     else:
-        all_weights = None
+        quantiles_helpers = None
 
     thresholds = None
-    edges_to_keep = None
 
-    if config.threshold_strategy == ThresholdStrategy.ActivationValue:
-        thresholds = process_thresholds(
-            raw_thresholds=config.thresholds,
-            dataset=dataset,
-            architecture=architecture,
-            dataset_size=100,
-        )
-    elif config.threshold_strategy == ThresholdStrategy.QuantilePerGraphLayer:
-        thresholds = config.thresholds.split("_")
-        thresholds = [val.split(";") for val in thresholds]
-        thresholds = {
-            (int(start), int(end)): float(val) for (start, end, val) in thresholds
-        }
-        logger.info(f"Using thresholds per graph {thresholds}")
-    elif config.threshold_strategy in [
+    if config.threshold_strategy in [
         ThresholdStrategy.UnderoptimizedMagnitudeIncrease,
         ThresholdStrategy.UnderoptimizedLargeFinal,
         ThresholdStrategy.UnderoptimizedRandom,
-        ThresholdStrategy.UnderoptimizedMagnitudeIncreaseComplement,
     ]:
         edges_to_keep = process_thresholds_underopt(
             raw_thresholds=config.thresholds,
             architecture=architecture,
             method=config.threshold_strategy,
-            thresholds_are_low_pass=config.thresholds_are_low_pass,
         )
+        architecture.threshold_layers(edges_to_keep)
 
-    if config.attack_type not in ["FGSM", "BIM", "FGSM_art", "BIM_art"]:
+    if config.attack_type not in ["FGSM", "PGD"]:
         all_epsilons = [1.0]
     elif config.all_epsilons is None:
         all_epsilons = [0.01, 0.05, 0.1, 0.4, 1.0]
@@ -186,6 +186,29 @@ def get_all_embeddings(config: Config):
     else:
         all_epsilons = config.all_epsilons
 
+    start_time = time.time()
+    if config.transfered_attacks:
+        logger.info(f"Generating datasets on the trensferred architecture")
+        trsf_archi = architecture
+        trsf_archi.epochs += 1
+        # Run the attacks on the external model (to generate the cache)
+        get_protocolar_datasets(
+            noise=config.noise,
+            dataset=dataset,
+            succ_adv=config.successful_adv > 0,
+            archi=trsf_archi,
+            dataset_size=config.dataset_size,
+            attack_type=config.attack_type,
+            attack_backend=config.attack_backend,
+            all_epsilons=all_epsilons,
+            compute_graph=False,
+            transfered_attacks=config.transfered_attacks,
+        )
+        architecture.epochs = architecture.epochs - 1
+        logger.info(
+            f"After generating transferred attacks, archi epochs = {architecture.epochs}"
+        )
+    # Get the protocolar datasets
     train_clean, test_clean, train_adv, test_adv = get_protocolar_datasets(
         noise=config.noise,
         dataset=dataset,
@@ -193,17 +216,20 @@ def get_all_embeddings(config: Config):
         archi=architecture,
         dataset_size=config.dataset_size,
         attack_type=config.attack_type,
+        attack_backend=config.attack_backend,
         all_epsilons=all_epsilons,
         compute_graph=False,
         transfered_attacks=config.transfered_attacks,
     )
+    detailed_times["protocolar_datasets"] = time.time() - start_time
 
     def chunks(lst, n):
         """Yield successive n-sized chunks from lst."""
+
         for i in range(0, len(lst), n):
             yield lst[i : i + n]
 
-    def embedding_getter(line_chunk):
+    def embedding_getter(line_chunk) -> List[Embedding]:
         ret = list()
         c = 0
         for line in line_chunk:
@@ -212,23 +238,36 @@ def get_all_embeddings(config: Config):
                     embedding_type=config.embedding_type,
                     line=line,
                     architecture=architecture,
-                    thresholds=thresholds,
-                    edges_to_keep=edges_to_keep,
-                    threshold_strategy=config.threshold_strategy,
-                    all_weights_for_sigmoid=all_weights,
-                    thresholds_are_low_pass=config.thresholds_are_low_pass,
+                    quantiles_helpers_for_sigmoid=quantiles_helpers,
                 )
             )
             c += 1
         return ret
 
-    def process(input_dataset):
+    stats_inside_embeddings = dict()
+
+    def process(input_dataset) -> List:
+
         my_chunks = chunks(input_dataset, len(input_dataset) // config.n_jobs)
-        ret = Parallel(n_jobs=config.n_jobs)(
-            delayed(embedding_getter)(chunk) for chunk in my_chunks
-        )
+
+        if config.n_jobs > 1:
+            ret = Parallel(n_jobs=config.n_jobs)(
+                delayed(embedding_getter)(chunk) for chunk in my_chunks
+            )
+        else:
+            ret = [embedding_getter(chunk) for chunk in my_chunks]
         ret = [item for sublist in ret for item in sublist]
-        return ret
+
+        # Extracting stats
+        for embedding in ret:
+            for key in embedding.time_taken:
+                stats_inside_embeddings[key] = (
+                    stats_inside_embeddings.get(key, 0) + embedding.time_taken[key]
+                )
+
+        return [embedding.value for embedding in ret]
+
+    start_time = time.time()
 
     # Clean train
     clean_embeddings_train = process(train_clean)
@@ -305,6 +344,11 @@ def get_all_embeddings(config: Config):
                     adv_embeddings_test[epsilon]
                 )
 
+    detailed_times["embeddings"] = time.time() - start_time
+
+    for key in stats_inside_embeddings:
+        detailed_times[key] = stats_inside_embeddings[key]
+
     return (
         clean_embeddings_train,
         clean_embeddings_test,
@@ -313,6 +357,7 @@ def get_all_embeddings(config: Config):
         thresholds,
         stats,
         stats_inf,
+        detailed_times,
     )
 
 
@@ -323,13 +368,6 @@ def run_experiment(config: Config):
 
     logger.info(f"Starting experiment {config.experiment_id}_{config.run_id} !!")
 
-    if __name__ != "__main__":
-        my_db.add_experiment(
-            experiment_id=config.experiment_id,
-            run_id=config.run_id,
-            config=config._asdict(),
-        )
-
     (
         embedding_train,
         embedding_test,
@@ -338,18 +376,17 @@ def run_experiment(config: Config):
         thresholds,
         stats,
         stats_inf,
+        detailed_times,
     ) = get_all_embeddings(config)
 
     if config.kernel_type == KernelType.RBF:
         param_space = [{"gamma": gamma} for gamma in np.logspace(-6, -3, 10)]
-    elif config.kernel_type in [
-        KernelType.SlicedWasserstein
-    ]:
+    elif config.kernel_type in [KernelType.SlicedWasserstein]:
         param_space = [{"M": 20, "sigma": sigma} for sigma in np.logspace(-3, 3, 7)]
     else:
         raise NotImplementedError(f"Unknown kernel {config.kernel_type}")
 
-    if config.attack_type in ["DeepFool", "CW"]:
+    if config.attack_type in ["DeepFool", "CW", AttackType.BOUNDARY]:
         stats_for_l2_norm_buckets = stats
     else:
         stats_for_l2_norm_buckets = dict()
@@ -364,16 +401,10 @@ def run_experiment(config: Config):
         stats_for_l2_norm_buckets=stats_for_l2_norm_buckets,
     )
 
-    logger.info(f"Threshold final = {thresholds}")
-    logger.info(
-        f"Results --> Unsup = {evaluation_results['unsupervised_metrics']} and sup = {evaluation_results['supervised_metrics']}"
-    )
-
-    end_time = time.time()
-
     metrics = {
         "name": "Graph",
-        "time": end_time - start_time,
+        "time": time.time() - start_time,
+        "detailed_times": detailed_times,
         "l2_diff": stats,
         "linf_diff": stats_inf,
         **evaluation_results,
@@ -384,11 +415,14 @@ def run_experiment(config: Config):
             {"_".join([str(v) for v in key]): thresholds[key] for key in thresholds},
         )
 
-    my_db.update_experiment(
-        experiment_id=config.experiment_id, run_id=config.run_id, metrics=metrics
+    logger.info(f"Done with experiment {config.experiment_id}_{config.run_id} !!")
+    logger.info(metrics)
+
+    logger.info(
+        f"Results --> Unsup = {evaluation_results['unsupervised_metrics']} and sup = {evaluation_results['supervised_metrics']}"
     )
 
-    logger.info(f"Done with experiment {config.experiment_id}_{config.run_id} !!")
+    return metrics
 
 
 if __name__ == "__main__":
@@ -400,9 +434,3 @@ if __name__ == "__main__":
         traceback.print_exc(file=my_trace)
 
         logger.error(my_trace.getvalue())
-
-        my_db.update_experiment(
-            experiment_id=my_config.experiment_id,
-            run_id=my_config.run_id,
-            metrics={"ERROR": re.escape(my_trace.getvalue())},
-        )

@@ -1,22 +1,26 @@
 import time
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, NamedTuple
 
 import fwg
 import numpy as np
 from joblib import Parallel, delayed
 
-from tda.embeddings.anonymous_walk import AnonymousWalks
 from tda.embeddings.persistent_diagrams import (
     sliced_wasserstein_kernel,
-    compute_dgm_from_graph
+    compute_dgm_from_graph,
 )
 from tda.embeddings.raw_graph import to_sparse_vector
 from tda.graph import Graph
-from tda.graph_dataset import DatasetLine
+from tda.dataset.graph_dataset import DatasetLine
 from tda.models import Architecture
 from tda.tda_logging import get_logger
 
 logger = get_logger("Embeddings")
+
+
+class Embedding(NamedTuple):
+    value: object
+    time_taken: Dict
 
 
 class EmbeddingType(object):
@@ -32,55 +36,46 @@ class KernelType(object):
 
 class ThresholdStrategy(object):
     NoThreshold = "NoThreshold"
-    ActivationValue = "ActivationValue"
-    UnderoptimizedMagnitudeIncrease = "UnderoptimizedMagnitudeIncrease"
-    UnderoptimizedMagnitudeIncreaseComplement = (
-        "UnderoptimizedMagnitudeIncreaseComplement"
-    )
     UnderoptimizedLargeFinal = "UnderoptimizedLargeFinal"
     UnderoptimizedRandom = "UnderoptimizedRandom"
-    QuantilePerGraphLayer = "QuantilePerGraphLayer"
+    UnderoptimizedMagnitudeIncrease = "UnderoptimizedMagnitudeIncrease"
 
 
 def get_embedding(
     embedding_type: str,
     line: DatasetLine,
     architecture: Architecture,
-    edges_to_keep,
-    thresholds: Dict,
-    threshold_strategy: str,
-    params: Dict = dict(),
-    all_weights_for_sigmoid=None,
-    thresholds_are_low_pass: bool = True,
-):
+    quantiles_helpers_for_sigmoid=None
+) -> Embedding:
+
+    time_taken = dict()
 
     if line.graph is None:
+        start = time.time()
         graph = Graph.from_architecture_and_data_point(
             architecture=architecture, x=line.x.double()
         )
+        time_taken["graph"] = time.time()-start
     else:
         graph = line.graph
 
-    if all_weights_for_sigmoid is not None:
-        graph.sigmoidize(all_weights=all_weights_for_sigmoid)
-    if threshold_strategy == ThresholdStrategy.ActivationValue:
-        graph.thresholdize(thresholds=thresholds, low_pass=thresholds_are_low_pass)
-    elif threshold_strategy in [
-        ThresholdStrategy.UnderoptimizedMagnitudeIncrease,
-        ThresholdStrategy.UnderoptimizedLargeFinal,
-        ThresholdStrategy.UnderoptimizedRandom,
-        ThresholdStrategy.UnderoptimizedMagnitudeIncreaseComplement,
-    ]:
-        graph.thresholdize_underopt(edges_to_keep)
-    elif threshold_strategy == ThresholdStrategy.QuantilePerGraphLayer:
-        graph.thresholdize_per_graph(
-            thresholds=thresholds, low_pass=thresholds_are_low_pass
-        )
+    if quantiles_helpers_for_sigmoid is not None:
+        start = time.time()
+        graph.sigmoidize(quantiles_helpers=quantiles_helpers_for_sigmoid)
+        time_taken["sigmoidize"] = time.time() - start
 
     if embedding_type == EmbeddingType.PersistentDiagram:
-        return compute_dgm_from_graph(graph)
+        start = time.time()
+        dgm = compute_dgm_from_graph(graph)
+        del graph
+        time_taken[f"E_{embedding_type}"] = time.time() - start
+        return Embedding(value=dgm, time_taken=time_taken)
     elif embedding_type == EmbeddingType.RawGraph:
-        return to_sparse_vector(graph.get_adjacency_matrix())
+        start = time.time()
+        mat = to_sparse_vector(graph.get_adjacency_matrix())
+        del graph
+        time_taken[f"E_{embedding_type}"] = time.time() - start
+        return Embedding(value=mat, time_taken=time_taken)
     else:
         raise NotImplementedError(embedding_type)
 
@@ -148,7 +143,7 @@ def get_gram_matrix(
     embeddings_in: List,
     embeddings_out: Optional[List] = None,
     params: List = [dict()],
-    n_jobs: int = 1
+    n_jobs: int = 1,
 ):
     """
     Compute the gram matrix of the given embeddings
