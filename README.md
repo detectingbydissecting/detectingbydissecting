@@ -122,9 +122,9 @@ Example:
 ```bash
 python tda/experiments/mahalanobis/mahalanobis_binary.py \
     --attack_type PGD \
-    --architecture cifar_lenet \
+    --architecture cifar_resnet_1 \
     --dataset CIFAR10 \
-    --epochs 300 \
+    --epochs 100 \
     --number_of_samples_for_mu_sigma 500 \
     --preproc_epsilon 0.01
 ```
