@@ -1,14 +1,24 @@
 from torch import nn
 from .layer import Layer
 from scipy.sparse import coo_matrix
-import numpy as np
+import torch
+from tda.precision import default_tensor_type
+
+torch.set_default_tensor_type(default_tensor_type)
 
 
 class LinearLayer(Layer):
-    def __init__(self, in_width, out_width, activ=None, name=None):
+    def __init__(self, in_width, out_width, activ=None, name=None, bias=True, p=0.0):
+
+        if p > 0.0:
+            func = nn.Sequential(
+                nn.Linear(in_width, out_width, bias=bias), nn.Dropout(p=p)
+            )
+        else:
+            func = nn.Linear(in_width, out_width, bias=bias)
 
         super().__init__(
-            func=nn.Linear(in_width, out_width), graph_layer=True, name=name
+            func=func, graph_layer=True, name=name,
         )
 
         self._in_width = in_width
@@ -22,7 +32,7 @@ class LinearLayer(Layer):
     def process(self, x, store_for_graph):
         assert isinstance(x, dict)
         _x = {key: x[key].reshape(-1, self._in_width) for key in x}
-        if store_for_graph:
+        if store_for_graph and self.graph_layer:
             self._activations = _x
         _x = sum(_x.values())
         if self._activ:

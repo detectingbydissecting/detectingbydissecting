@@ -5,7 +5,10 @@ from time import time
 
 import numpy as np
 import torch
+import mlflow
 from torch import nn, optim, no_grad
+from torch.optim.lr_scheduler import _LRScheduler
+from typing import List, Optional
 
 from tda.devices import device
 from tda.models.architectures import (
@@ -21,16 +24,59 @@ from tda.models.architectures import (
     fashion_mnist_mlp,
     cifar_resnet_1,
     svhn_resnet_1,
+    toy_mlp,
+    toy_mlp2,
+    toy_mlp3,
+    toy_mlp4,
+    efficientnet,
 )
 from tda.dataset.datasets import Dataset
+from tda.models.layers import ConvLayer, LinearLayer
 from tda.rootpath import rootpath
 from tda.tda_logging import get_logger
+from tda.precision import default_tensor_type
+
+torch.set_default_tensor_type(default_tensor_type)
 
 logger = get_logger("Models")
 
-torch.set_default_tensor_type(torch.DoubleTensor)
+mlflow.set_experiment("tda_adv_detection")
 
 pathlib.Path("/tmp/tda/trained_models").mkdir(parents=True, exist_ok=True)
+
+
+class GradualWarmupScheduler(_LRScheduler):
+    """ Gradually warm-up(increasing) learning rate in optimizer.
+    Proposed in 'Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour'.
+    Args:
+        optimizer (Optimizer): Wrapped optimizer.
+        multiplier: target learning rate = base lr * multiplier
+        total_epoch: target learning rate is reached at total_epoch, gradually
+        after_scheduler: after target_epoch, use this scheduler(eg. ReduceLROnPlateau)
+    """
+
+    def __init__(self, optimizer, multiplier, total_epoch, after_scheduler):
+        self.multiplier = multiplier
+        if self.multiplier <= 1.0:
+            raise ValueError("multiplier should be greater than 1.")
+        self.total_epoch = total_epoch
+        self.after_scheduler = after_scheduler
+        self.finished = False
+        super().__init__(optimizer)
+
+    def get_lr(self):
+        return [
+            base_lr
+            / self.multiplier
+            * ((self.multiplier - 1.0) * self.last_epoch / self.total_epoch + 1.0)
+            for base_lr in self.base_lrs
+        ]
+
+    def step(self, epoch=0):
+        if epoch > self.total_epoch:
+            self.after_scheduler.step(epoch - self.total_epoch)
+        else:
+            super(GradualWarmupScheduler, self).step(epoch)
 
 
 def compute_val_acc(model, val_loader):
@@ -41,7 +87,7 @@ def compute_val_acc(model, val_loader):
     model.eval()
     with no_grad():
         for data, target in val_loader:
-            data = data.double()
+            data = data.type(default_tensor_type)
             data = data.to(device)
             target = target.to(device)
             output = model(data)
@@ -60,7 +106,7 @@ def compute_test_acc(model, test_loader):
     correct = 0
     with no_grad():
         for data, target in test_loader:
-            data = data.double()
+            data = data.type(default_tensor_type)
             data = data.to(device)
             target = target.to(device)
             output = model(data)
@@ -84,7 +130,7 @@ def go_training(
     mask_=None,
 ):
 
-    x = x.double()
+    x = x.type(default_tensor_type)
     y = y.to(device)
     optimizer.zero_grad()
 
@@ -99,9 +145,9 @@ def go_training(
     if train_noise > 0:
         logger.info(f"Training with noise...")
         if epoch >= 25:  # Warm start
-            x_noisy = torch.clamp(
-                x + train_noise * torch.randn(x.size()), 0, 1
-            ).double()
+            x_noisy = torch.clamp(x + train_noise * torch.randn(x.size()), 0, 1).type(
+                default_tensor_type
+            )
             y_pred = model(x)
             y_pred_noisy = model(x_noisy)
             loss = 0.75 * loss_func(y_pred, y) + 0.25 * loss_func(y_pred_noisy, y)
@@ -120,6 +166,8 @@ def go_training(
                 param.data = param.data * mask_[i]
                 param.grad.data = param.grad.data * mask_[i]
 
+    return loss.item()
+
 
 def train_network(
     model: Architecture,
@@ -135,9 +183,21 @@ def train_network(
     """
     Helper function to train an arbitrary model
     """
+    # Save initial model
+    torch.save(model, model.get_model_savepath(initial=True))
+    mlflow.log_artifact(model.get_model_savepath(initial=True), "models")
+
     # Save model initial values
     model.epochs = num_epochs
     model.to_device(device)
+
+    def init_weights(mod):
+        if isinstance(mod, torch.nn.Conv2d) or isinstance(mod, torch.nn.Linear):
+            torch.nn.init.xavier_uniform(mod.weight)
+
+    for layer in model.layers:
+        if isinstance(layer, ConvLayer) or isinstance(layer, LinearLayer):
+            layer.func.apply(init_weights)
 
     logger.info(f"Learnig on device {device}")
 
@@ -169,6 +229,8 @@ def train_network(
         model.epochs = 99
         model.to_device(device)
         model.tot_prune_percentile = 0.76
+    else:
+        init_weight_dict = None
 
     if model.name in [mnist_lenet.name, fashion_mnist_lenet.name]:
         lr = 0.001
@@ -191,7 +253,7 @@ def train_network(
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", patience=patience, verbose=True, factor=0.5
         )
-    elif model.name == cifar_lenet.name:
+    elif model.name in [cifar_lenet.name]:
         lr = 0.0008
         patience = 50
         optimizer = optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.99))
@@ -224,6 +286,37 @@ def train_network(
         optimizer = optim.SGD(
             model.parameters(), lr=lr(0), weight_decay=0.0005, momentum=0.9
         )
+    elif model.name in [toy_mlp.name, toy_mlp2.name, toy_mlp3, toy_mlp4]:
+        lr = 5
+        patience = 5
+        optimizer = optim.SGD(model.parameters(), lr=lr)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", patience=patience, verbose=True, factor=0.75
+        )
+    elif model.name in [efficientnet.name]:
+        lr = 0.1
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4
+        )
+
+        eta_min = 0.0001
+        mlflow.log_param("eta_min", eta_min)
+
+        def get_scheduler(optimizer, n_iter_per_epoch):
+            cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer=optimizer,
+                eta_min=eta_min,  #  0.000001,
+                T_max=(num_epochs - 0 - 20) * n_iter_per_epoch,
+            )
+            scheduler = GradualWarmupScheduler(
+                optimizer,
+                multiplier=16,
+                total_epoch=20 * n_iter_per_epoch,
+                after_scheduler=cosine_scheduler,
+            )
+            return scheduler
+
+        scheduler = get_scheduler(optimizer, len(train_loader))
 
     else:
         logger.warn(f"Unknown model {model.name}... Using default optimizer")
@@ -244,11 +337,14 @@ def train_network(
         )
         t = time()
         model.set_train_mode()
+        mlflow.log_metric(
+            "lr", [param["lr"] for param in optimizer.param_groups][0], step=epoch
+        )
 
         if custom_scheduler_step is not None:
             custom_scheduler_step(optimizer, epoch)
 
-        if epoch == 0:
+        if (epoch == 0) and (prune_percentile > 0.0):
             # mask_ = None
             model, mask_ = prune_model(
                 model,
@@ -256,12 +352,15 @@ def train_network(
                 init_weight=init_weight_dict,
                 zero_grad=False,
             )
+        elif (epoch == 0) and (prune_percentile == 0.0):
+            mask_ = None
 
-        for x_batch, y_batch in train_loader:
+        train_loss = list()
+        for i_batch, (x_batch, y_batch) in enumerate(train_loader):
             # Training !!
             # if epoch == 0:
             # mask_ = None
-            go_training(
+            loss = go_training(
                 model,
                 x_batch,
                 y_batch,
@@ -273,21 +372,35 @@ def train_network(
                 first_pruned_iter=first_pruned_iter,
                 mask_=mask_,
             )
+            train_loss.append(loss)
+        mlflow.log_metric("train_loss", np.mean(train_loss), step=epoch)
 
         model.set_eval_mode()
+        val_losses = list()
+        num_val_batches = 0
         for x_val, y_val in val_loader:
             y_val = y_val.to(device)
-            x_val = x_val.double()
+            x_val = x_val.type(default_tensor_type)
             y_val_pred = model(x_val)
             val_loss = loss_func(y_val_pred, y_val)
-            logger.info(f"Validation loss = {np.around(val_loss.item(), decimals=4)}")
-            loss_history.append(val_loss.item())
-            break
+            val_losses.append(val_loss.item())
+            num_val_batches += 1
+            #  if num_val_batches > 10:
+            #      break
+        val_loss = np.mean(val_losses)
+        mlflow.log_metric("val_loss", val_loss, step=epoch)
+        logger.info(f"Validation loss = {np.around(val_loss, decimals=4)}")
+        loss_history.append(val_loss)
+
         if (prune_percentile == 0.0) or (epoch > first_pruned_iter * nb_iter_prune):
+            step = epoch * len(train_loader) + i_batch
+            # step = (epoch % 300) * len(train_loader) + i_batch
             if scheduler is not None:
-                scheduler.step(val_loss)
+                scheduler.step(step)
         if epoch % 10 == 9:
-            logger.info(f"Val acc = {compute_val_acc(model, val_loader)}")
+            acc = compute_val_acc(model, val_loader)
+            logger.info(f"Val acc = {acc}")
+            mlflow.log_metric("val_acc", acc, step=epoch)
         if epoch > 0:
             save_pruned_model(
                 model,
@@ -325,6 +438,10 @@ def train_network(
             f"Percentgage of zero parameters = {pruned_count_} and model pruned param = {model.tot_prune_percentile}"
         )
 
+    # Saving model
+    torch.save(model, model.get_model_savepath())
+    mlflow.log_artifact(model.get_model_savepath(), "models")
+
     return model, loss_history
 
 
@@ -339,9 +456,32 @@ def get_deep_model(
     with_details: bool = False,
     force_retrain: bool = False,
     pretrained_pth: str = None,
+    layers_to_consider: Optional[List[int]] = list(),
 ) -> Architecture:
 
-    loss_func = nn.CrossEntropyLoss()
+    loss_func = nn.CrossEntropyLoss().type(default_tensor_type)
+
+    if dataset.name == "CIFAR100":
+        architecture.set_train_mode()
+        optimizer = optim.SGD(architecture.parameters(), lr=0.001)
+        for i_batch, (x_batch, y_batch) in enumerate(dataset.train_loader):
+            x_batch = x_batch.type(default_tensor_type)
+            y_batch = y_batch.to(device)
+            optimizer.zero_grad()
+            y_pred = architecture(x_batch)
+            loss = loss_func(y_pred, y_batch)
+            loss.backward()
+            optimizer.step()
+        architecture.set_eval_mode()
+        architecture.is_trained = True
+
+        # Build matrices
+        x = dataset.train_dataset[0][0].to(device)
+        architecture.forward(x, store_for_graph=False, output="final")
+        if layers_to_consider is not None:
+            architecture.set_layers_to_consider(layers_to_consider)
+        assert architecture.matrices_are_built is True
+        return architecture
 
     if pretrained_pth is not None:
         # Experimental: to help loading an existing model
@@ -369,22 +509,36 @@ def get_deep_model(
     try:
         if force_retrain:
             raise FileNotFoundError("Force retrain")
-        architecture = torch.load(
-            architecture.get_model_savepath(), map_location=device
-        )
+        if dataset.name == "cifar100":
+            logger.info(f"Loaded pretrained model for CIFAR100")
+            architecture.set_train_mode()
+            optimizer = optim.SGD(architecture.parameters(), lr=0.001)
+            for i_batch, (x_batch, y_batch) in enumerate(dataset.train_loader):
+                x_batch = x_batch.type(default_tensor_type)
+                y_batch = y_batch.to(device)
+                optimizer.zero_grad()
+                y_pred = architecture(x_batch)
+                loss = loss_func(y_pred, y_batch)
+                loss.backward()
+                optimizer.step()
+            architecture.set_eval_mode()
+        else:
+            architecture = torch.load(
+                architecture.get_model_savepath(), map_location=device
+            )
+            logger.info(
+                f"Loaded successfully model from {architecture.get_model_savepath()}"
+            )
         logger.info(
-            f"Loaded successfully model from {architecture.get_model_savepath()}"
+            f"Test accuracy = {compute_test_acc(architecture, dataset.test_loader)}"
         )
     except FileNotFoundError:
         logger.info(
             f"Unable to find model in {architecture.get_model_savepath()}... Retraining it..."
         )
 
-        x = dataset.train_dataset[0][0].to(device)
-        architecture.forward(x, store_for_graph=False, output="final")
-        assert architecture.matrices_are_built is True
-
         # Train the NN
+        #  with mlflow.start_run(run_name=f"Train {architecture.name}"):
         train_network(
             architecture,
             dataset.train_loader,
@@ -397,9 +551,6 @@ def get_deep_model(
             first_pruned_iter,
         )
 
-        # Saving model
-        torch.save(architecture, architecture.get_model_savepath())
-
         # Compute accuracies
         val_accuracy = compute_val_acc(architecture, dataset.val_loader)
         logger.info(f"Validation accuracy = {val_accuracy}")
@@ -408,13 +559,18 @@ def get_deep_model(
 
     # Forcing eval mode just in case it was not done before
     architecture.set_eval_mode()
+    logger.info(f"set archi in eval mode")
     architecture.is_trained = True
+
+    # Build matrices
+    x = dataset.train_dataset[0][0].to(device)
+    architecture.forward(x, store_for_graph=False, output="final")
+    if layers_to_consider is not None:
+        architecture.set_layers_to_consider(layers_to_consider)
+    assert architecture.matrices_are_built is True
 
     if with_details:
         return architecture, val_accuracy, test_accuracy
-
-    # Build matrices
-    assert architecture.matrices_are_built is True
 
     return architecture
 
@@ -459,7 +615,7 @@ def prune_model(model, percentile=0.1, init_weight=None, zero_grad=True):
                 )
             mask = (
                 torch.tensor(np.where(abs(param.data.cpu()) < perc, 0, 1))
-                .double()
+                .type(default_tensor_type)
                 .to(device)
             )
             mask_dict[i] = mask

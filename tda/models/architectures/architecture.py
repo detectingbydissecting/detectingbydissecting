@@ -4,7 +4,8 @@ from typing import List, Callable, Tuple, Dict
 
 import torch
 import torch.nn as nn
-from art.classifiers import PyTorchClassifier
+
+# from art.classifiers import PyTorchClassifier
 import foolbox as fb
 from cached_property import cached_property
 
@@ -15,8 +16,9 @@ from tda.models.layers import (
 )
 from tda.rootpath import model_dir
 from tda.tda_logging import get_logger
+from tda.precision import default_tensor_type
 
-torch.set_default_tensor_type(torch.DoubleTensor)
+torch.set_default_tensor_type(default_tensor_type)
 logger = get_logger("Architecture")
 
 #################
@@ -53,7 +55,9 @@ class Architecture(nn.Module):
             layer_params = dict(layer.func.named_parameters())
             layer_name = layer.name or f"layer{i}"
             for name in layer_params:
-                self.register_parameter(f"{layer_name}_{name}", layer_params[name])
+                self.register_parameter(
+                    f"{layer_name}_{name.replace('.', '_')}", layer_params[name]
+                )
 
         self.is_trained = False
 
@@ -72,16 +76,21 @@ class Architecture(nn.Module):
     def set_default_forward_mode(self, mode):
         self.default_forward_mode = mode
 
+    def set_layers_to_consider(self, layers_to_consider: List[int]):
+        for layer_idx, layer in enumerate(self.layers):
+            if layer_idx not in layers_to_consider:
+                layer.graph_layer = False
+
     def build_matrices(self):
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             if layer.graph_layer:
-                logger.info(f"Building matrix for layer {layer}")
+                logger.info(f"Building matrix for layer {layer_idx} ({layer})")
                 layer.build_matrix()
 
     def threshold_layers(self, edges_to_keep):
         for layeridx, layer in enumerate(self.layers):
             if (layer.graph_layer) and (layeridx in edges_to_keep.keys()):
-                #logger.info(f"Thresholding layer {layeridx} !!")
+                # logger.info(f"Thresholding layer {layeridx} !!")
                 edges_to_keep_layer = edges_to_keep[layeridx]
                 layer.get_matrix_thresholded(edges_to_keep_layer)
         logger.info(f"Done thresholding")
@@ -91,8 +100,9 @@ class Architecture(nn.Module):
         try:
             self.build_matrices()
             done = True
-        except Exception:
+        except Exception as e:
             done = False
+            raise e
         return done
 
     def get_layer_matrices(self):
@@ -222,19 +232,18 @@ class Architecture(nn.Module):
         if not torch.is_tensor(x):
             x = torch.Tensor(x)
 
-        x = x.to(device)
         if self.preprocess is not None:
             x = self.preprocess(x)
 
-        outputs = {-1: x.double()}
+        outputs = {-1: x.type(default_tensor_type).to(device)}
 
         # Going through all layers
         for layer_idx in self.layer_visit_order:
-            # logger.info(f"Layer nb {layer_idx}")
+            #  logger.info(f"Layer nb {layer_idx}")
             if layer_idx != -1:
                 layer = self.layers[layer_idx]
                 input = {
-                    parent_idx: outputs[parent_idx].double()
+                    parent_idx: outputs[parent_idx]
                     for parent_idx in self.parent_dict[layer_idx]
                 }
                 outputs[layer_idx] = layer.process(

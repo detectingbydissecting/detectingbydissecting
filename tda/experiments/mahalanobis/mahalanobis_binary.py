@@ -521,10 +521,6 @@ def run_experiment(config: Config):
 
     logger.info(metrics)
 
-    logger.info(
-        f"Results --> Unsup = {evaluation_results['unsupervised_metrics']} and sup = {evaluation_results['supervised_metrics']}"
-    )
-
     return metrics
 
 

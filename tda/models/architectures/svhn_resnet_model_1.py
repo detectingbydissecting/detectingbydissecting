@@ -1,95 +1,17 @@
-import torch.nn.functional as F
-
+from .architecture import Architecture
+from .svhn_models import svhn_preprocess
 from tda.models.layers import (
     ConvLayer,
-    MaxPool2dLayer,
-    LinearLayer,
-    SoftMaxLayer,
     BatchNorm2d,
     ReluLayer,
     AvgPool2dLayer,
+    LinearLayer,
+    SoftMaxLayer,
 )
-from .architecture import Architecture
+import torch.nn.functional as F
 
-
-######################
-# SVHN Architectures #
-######################
-
-
-def svhn_preprocess(x):
-    return x.reshape(-1, 3, 32, 32)
-
-def svhn_preprocess_bandw(x):
-    return x.view(-1, 1, 32, 32)
-
-def svhn_preprocess_resize(x):
-    x = x.reshape(-1, 3, 32, 32)
-    x = F.interpolate(x, scale_factor=7.5)
-    x = x.reshape(-1, 3, 240, 240)
-    return x
-
-
-svhn_cnn_simple = Architecture(
-    name="simple_cnn_svhn",
-    preprocess=svhn_preprocess,
-    layers=[
-        ConvLayer(3, 8, 5),  # output 8 * 28 * 28
-        ConvLayer(8, 3, 5),  # output 3 * 24 * 24
-        LinearLayer(3 * 24 * 24, 500),
-        LinearLayer(500, 256),
-        LinearLayer(256, 10),
-        SoftMaxLayer(),
-    ],
-)
-
-svhn_lenet = Architecture(
-    name="svhn_lenet",
-    preprocess=svhn_preprocess,
-    layers=[
-        ConvLayer(3, 6, 5, activ=F.relu),  # output 6 * 28 * 28
-        MaxPool2dLayer(2),
-        ConvLayer(6, 16, 5, activ=F.relu),
-        MaxPool2dLayer(2),  # output 16 * 5 * 5
-        LinearLayer(16 * 5 * 5, 120, activ=F.relu),
-        LinearLayer(120, 84, activ=F.relu),
-        LinearLayer(84, 10),
-        SoftMaxLayer(),
-    ],
-)
-
-svhn_lenet_bandw = Architecture(
-    name="svhn_lenet_bandw",
-    preprocess=svhn_preprocess_bandw,
-    layers=[
-        ConvLayer(1, 6, 5, activ=F.relu),  # output 6 * 28 * 28
-        MaxPool2dLayer(2),
-        ConvLayer(6, 16, 5, activ=F.relu),
-        MaxPool2dLayer(2),  # output 16 * 5 * 5
-        LinearLayer(16 * 5 * 5, 120, activ=F.relu),
-        LinearLayer(120, 84, activ=F.relu),
-        LinearLayer(84, 10),
-        SoftMaxLayer(),
-    ],
-)
-
-svhn_lenet_bandw2 = Architecture(
-    name="svhn_lenet_bandw2",
-    preprocess=svhn_preprocess_bandw,
-    layers=[
-        ConvLayer(1, 3, 5, activ=F.relu),  # output 3 * 28 * 28
-        MaxPool2dLayer(2), # 3 * 14 * 14
-        ConvLayer(3, 6, 5, activ=F.relu), # 6 * 10 * 10
-        MaxPool2dLayer(2),  # output 6 * 5 * 5
-        LinearLayer(6 * 5 * 5, 100, activ=F.relu),
-        LinearLayer(100, 50, activ=F.relu),
-        LinearLayer(50, 10),
-        SoftMaxLayer(),
-    ],
-)
-
-svhn_resnet = Architecture(
-    name="svhn_resnet",
+svhn_resnet_1 = Architecture(
+    name="svhn_resnet_1",
     preprocess=svhn_preprocess,
     layers=[
         # 1st layer / no stack or block
@@ -310,47 +232,4 @@ svhn_resnet = Architecture(
         (31, 47),
         (47, 36),
     ],
-)
-
-svhn_resnet_test = Architecture(
-    name="svhn_resnet_test",
-    preprocess=svhn_preprocess,
-    layers=[
-        # 1st layer / no stack or block
-        ConvLayer(
-            in_channels=3,
-            out_channels=64,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-            bias=False,
-        ),
-        #  Stack 1
-        # Block a
-        BatchNorm2d(channels=64, activ=F.relu),
-        ConvLayer(
-            in_channels=64,
-            out_channels=64,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-            bias=False,
-        ),
-        BatchNorm2d(channels=64, activ=F.relu),
-        ConvLayer(
-            in_channels=64,
-            out_channels=64,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-            bias=False,
-        ),
-        BatchNorm2d(channels=64),
-        ReluLayer(),
-        # End part
-        AvgPool2dLayer(kernel_size=32),
-        LinearLayer(64, 10),
-        SoftMaxLayer(),
-    ],
-    layer_links=[(i - 1, i) for i in range(10)] + [(1, 6)],
 )
