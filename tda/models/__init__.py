@@ -478,7 +478,7 @@ def get_deep_model(
         # Build matrices
         x = dataset.train_dataset[0][0].to(device)
         architecture.forward(x, store_for_graph=False, output="final")
-        if layers_to_consider is not None:
+        if layers_to_consider is not None and len(layers_to_consider)!=0:
             architecture.set_layers_to_consider(layers_to_consider)
         assert architecture.matrices_are_built is True
         return architecture
@@ -565,7 +565,7 @@ def get_deep_model(
     # Build matrices
     x = dataset.train_dataset[0][0].to(device)
     architecture.forward(x, store_for_graph=False, output="final")
-    if layers_to_consider is not None:
+    if layers_to_consider is not None and len(layers_to_consider)!=0:
         architecture.set_layers_to_consider(layers_to_consider)
     assert architecture.matrices_are_built is True
 
